@@ -3642,56 +3642,167 @@ None of these are complicated. All of them are ignored by most people. Pick one,
     if (btn) btn.disabled = state.render.running;
   }
 
-  const btnRender = $('#btnRender');
-  if (btnRender){
-    btnRender.addEventListener('click', () => {
-      if (state.render.running) return;
-      if (!state.scenes.length){
-        toast('Nothing to render', 'Create scenes first — the render stage assembles existing clips only.', 'warn');
-        return;
-      }
-      state.render.running = true;
-      state.render.done = false;
-      btnRender.disabled = true;
-      const dl = $('#btnDownloadMp4');
-      if (dl) dl.disabled = true;
+  /* ============================================================
+     Browser video renderer
+     Creates a real WebM video locally from the generated scenes.
+     No API key or server is required. This is a storyboard/video
+     renderer, not an AI video-generation backend.
+  ============================================================ */
+  let renderedVideoBlob = null;
+  let renderedVideoUrl = null;
 
-      const steps = $$('#renderSteps .rstep');
-      steps.forEach(s => s.classList.remove('active', 'done'));
-      const status = $('#renderStatus');
-      const bar = $('#renderProgress');
-      const pct = $('#renderPercent');
-      const eta = $('#renderEta');
-      if (status) status.textContent = 'Assembling ' + state.scenes.length + ' clips into one continuous video…';
+  function drawVideoFrame(ctx, canvas, scene, sceneIndex, sceneCount, t){
+    const W = canvas.width, H = canvas.height;
+    const g = ctx.createLinearGradient(0, 0, W, H);
+    g.addColorStop(0, '#0b1220');
+    g.addColorStop(1, '#18283a');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
 
-      let p = 0;
-      const timer = setInterval(() => {
-        p += 1.1 + Math.random() * 2.4;
-        p = Math.min(100, p);
-        if (bar) bar.style.width = p + '%';
-        if (pct) pct.textContent = Math.round(p) + '%';
-        if (eta) eta.textContent = 'ETA ' + fmtTime(Math.max(0, (100 - p) * 0.42));
+    // cinematic glow / moving light
+    const x = W * (0.15 + 0.7 * ((Math.sin(t * 0.45) + 1) / 2));
+    const glow = ctx.createRadialGradient(x, H * 0.28, 10, x, H * 0.28, W * 0.5);
+    glow.addColorStop(0, 'rgba(255,255,255,.14)');
+    glow.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, W, H);
 
-        const stepIndex = Math.min(steps.length - 1, Math.floor((p / 100) * steps.length));
-        steps.forEach((s, i) => {
-          s.classList.toggle('done', i < stepIndex || p >= 100);
-          s.classList.toggle('active', i === stepIndex && p < 100);
-        });
+    // progress marker
+    ctx.fillStyle = 'rgba(255,255,255,.55)';
+    ctx.font = '600 22px Arial';
+    ctx.fillText('MIRABAI · DOCUMENTARY', 70, 70);
+    ctx.font = '400 20px Arial';
+    ctx.fillText('SCENE ' + (sceneIndex + 1) + ' / ' + sceneCount, 70, 105);
 
-        if (p >= 100){
-          clearInterval(timer);
-          state.render.running = false;
-          state.render.done = true;
-          btnRender.disabled = false;
-          btnRender.innerHTML = '<span class="sweep"></span>Re-render final video';
-          if (dl) dl.disabled = false;
-          if (status) status.textContent = 'Render complete. Your MP4 is assembled from ' + state.scenes.length + ' clips at ' + state.project.resolution + '.';
-          if (eta) eta.textContent = 'Completed just now';
-          toast('Render complete', 'Final MP4 assembled. Use the download button below.', 'ok');
-          updateChecklist();
-        }
-      }, 110);
+    const title = scene && scene.title ? scene.title : 'Untitled scene';
+    const narration = scene && scene.narration ? scene.narration : '';
+    const maxW = W - 140;
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '700 54px Arial';
+    const titleWords = title.split(/\s+/);
+    let line = '', lines = [];
+    titleWords.forEach(word => {
+      const test = line ? line + ' ' + word : word;
+      if (ctx.measureText(test).width > maxW && line){ lines.push(line); line = word; }
+      else line = test;
     });
+    if (line) lines.push(line);
+    lines.slice(0, 3).forEach((l, i) => ctx.fillText(l, 70, H * 0.46 + i * 66));
+
+    ctx.fillStyle = 'rgba(255,255,255,.82)';
+    ctx.font = '400 27px Arial';
+    const excerpt = narration.replace(/\s+/g, ' ').trim().slice(0, 190);
+    let nline = '', nlines = [];
+    excerpt.split(/\s+/).forEach(word => {
+      const test = nline ? nline + ' ' + word : word;
+      if (ctx.measureText(test).width > maxW && nline){ nlines.push(nline); nline = word; }
+      else nline = test;
+    });
+    if (nline) nlines.push(nline);
+    nlines.slice(0, 3).forEach((l, i) => ctx.fillText(l, 70, H * 0.70 + i * 38));
+
+    ctx.fillStyle = 'rgba(255,255,255,.28)';
+    ctx.fillRect(70, H - 70, W - 140, 3);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(70, H - 70, (W - 140) * Math.min(1, t / Math.max(0.01, scene.duration || 1)), 3);
+  }
+
+  async function renderRealVideo(){
+    const btn = $('#btnRender');
+    const dl = $('#btnDownloadMp4');
+    const bar = $('#renderProgress');
+    const pct = $('#renderPct');
+    const status = $('#renderStatus');
+    const eta = $('#renderEta');
+    const steps = $$('#renderSteps .rstep');
+
+    if (!state.scenes.length){
+      toast('Nothing to render', 'Create scenes first.', 'warn');
+      return;
+    }
+    if (!window.MediaRecorder){
+      toast('Browser not supported', 'This browser does not support local video recording. Try Chrome or Edge.', 'warn');
+      return;
+    }
+
+    state.render.running = true;
+    state.render.done = false;
+    renderedVideoBlob = null;
+    if (renderedVideoUrl){ URL.revokeObjectURL(renderedVideoUrl); renderedVideoUrl = null; }
+    if (btn) btn.disabled = true;
+    if (dl) dl.disabled = true;
+    steps.forEach(s => s.classList.remove('active', 'done'));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = state.project.resolution === '720p' ? 1280 : 1920;
+    canvas.height = state.project.aspect === '9:16' ? Math.round(canvas.width * 16 / 9) : Math.round(canvas.width * 9 / 16);
+    // Keep the browser workload reasonable for very tall portrait projects.
+    if (state.project.aspect === '9:16') { canvas.width = 720; canvas.height = 1280; }
+    const ctx = canvas.getContext('2d');
+    const stream = canvas.captureStream(30);
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+    const recorder = new MediaRecorder(stream, {mimeType:mime});
+    const chunks = [];
+    recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+
+    const totalDuration = state.scenes.reduce((a, s) => a + Math.max(1, Number(s.duration) || 1), 0);
+    let completed = 0;
+
+    const setStep = (idx) => steps.forEach((s, i) => {
+      s.classList.toggle('done', i < idx);
+      s.classList.toggle('active', i === idx);
+    });
+
+    recorder.start(250);
+    setStep(0);
+    if (status) status.textContent = 'Rendering scenes locally in your browser…';
+
+    for (let i = 0; i < state.scenes.length; i++){
+      const scene = state.scenes[i];
+      const duration = Math.max(1, Number(scene.duration) || 1);
+      const started = performance.now();
+      await new Promise(resolve => {
+        const tick = now => {
+          const elapsed = (now - started) / 1000;
+          const local = Math.min(duration, elapsed);
+          drawVideoFrame(ctx, canvas, scene, i, state.scenes.length, local);
+          completed += 0;
+          const overall = Math.min(100, ((state.scenes.slice(0, i).reduce((a,s)=>a+Math.max(1,Number(s.duration)||1),0) + local) / totalDuration) * 100);
+          if (bar) bar.style.width = overall + '%';
+          if (pct) pct.textContent = Math.round(overall) + '%';
+          if (eta) eta.textContent = 'Rendering scene ' + (i + 1) + ' of ' + state.scenes.length;
+          setStep(Math.min(4, Math.floor((overall / 100) * 5)));
+          if (elapsed < duration) requestAnimationFrame(tick); else resolve();
+        };
+        requestAnimationFrame(tick);
+      });
+    }
+
+    setStep(4);
+    await new Promise(resolve => { recorder.onstop = resolve; recorder.stop(); });
+    stream.getTracks().forEach(t => t.stop());
+    renderedVideoBlob = new Blob(chunks, {type:'video/webm'});
+    renderedVideoUrl = URL.createObjectURL(renderedVideoBlob);
+    state.render.running = false;
+    state.render.done = true;
+    if (btn){ btn.disabled = false; btn.innerHTML = '<span class="sweep"></span>Re-render video'; }
+    if (dl) dl.disabled = false;
+    if (bar) bar.style.width = '100%';
+    if (pct) pct.textContent = '100%';
+    if (status) status.textContent = 'Video ready. Download the WebM file below.';
+    if (eta) eta.textContent = 'Completed just now';
+    steps.forEach(s => { s.classList.remove('active'); s.classList.add('done'); });
+    updateChecklist();
+    toast('Video ready', 'A real browser-rendered WebM video has been created.', 'ok');
+  }
+
+  const oldRenderButton = $('#btnRender');
+  if (oldRenderButton){
+    const fresh = oldRenderButton.cloneNode(true);
+    oldRenderButton.replaceWith(fresh);
+    fresh.addEventListener('click', renderRealVideo);
   }
 
   function downloadFile(filename, content, mime){
@@ -3739,19 +3850,18 @@ None of these are complicated. All of them are ignored by most people. Pick one,
         toast('Render first', 'Complete the final render before downloading.', 'warn');
         return;
       }
-      const manifest = [
-        'AI Video Studio — final render manifest',
-        'Project: ' + state.project.name,
-        'Duration: ' + fmtTime(Math.max(timelineEnd(), 0)),
-        'Resolution: ' + state.project.resolution + ' · ' + state.project.aspect,
-        'Scenes: ' + state.scenes.length + ' · Clips: ' + state.scenes.filter(s => s.status === 'done').length,
-        'Codec: ' + (($('#renderFormat') && $('#renderFormat').value) || 'MP4 · H.264'),
-        '',
-        'This interactive demo ships a placeholder container file.',
-        'In a self-hosted deployment this button streams the real MP4 encoded by FFmpeg.'
-      ].join('\n');
-      downloadFile((state.project.name || 'ai-video').replace(/[^\w\-]+/g, '-').toLowerCase() + '.mp4', manifest, 'video/mp4');
-      toast('Download started', 'Demo build: the MP4 placeholder plus full project data were downloaded.', 'ok');
+      if (!renderedVideoBlob){
+        toast('Render first', 'Create the video before downloading.', 'warn');
+        return;
+      }
+      const url = renderedVideoUrl || URL.createObjectURL(renderedVideoBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = (state.project.name || 'ai-video').replace(/[^\w\-]+/g, '-').toLowerCase() + '.webm';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      toast('Download started', 'Your real browser-rendered WebM video is downloading.', 'ok');
     });
   }
 
